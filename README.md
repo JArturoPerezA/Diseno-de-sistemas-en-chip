@@ -1,2 +1,2 @@
 # Diseno-de-sistemas-en-chip
-Materia de 4 semestre de IRS enfocado en el microcontrolador ATmega16. Hay códigos de prácticas y el proyecto
+Proyecto de un control de inventario en Microchip AVR en C con el ATmega16. Se usa RFID, LCD, ultrasónicos, servomotor.
