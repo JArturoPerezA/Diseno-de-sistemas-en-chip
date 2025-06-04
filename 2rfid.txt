@@ -1,0 +1,475 @@
+#define F_CPU 8000000UL  // 8 MHz
+
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <string.h>
+#include "twi_lcd.h"
+
+// Definiciones de pines para ATmega16
+#define SS1_PIN     PB4     // Pin 5 (SS para primer lector)
+#define SS2_PIN     PB3     // Pin 4 (SS para segundo lector) - NUEVO PIN
+#define MOSI_PIN    PB5     // Pin 6 (MOSI) - Compartido
+#define MISO_PIN    PB6     // Pin 7 (MISO) - Compartido
+#define SCK_PIN     PB7     // Pin 8 (SCK) - Compartido
+#define RST_PIN     PB0     // Pin 16 (RST) - Compartido
+
+// Comandos MFRC522
+#define PCD_IDLE                0x00
+#define PCD_AUTHENT             0x0E
+#define PCD_RECEIVE             0x08
+#define PCD_TRANSMIT            0x04
+#define PCD_TRANSCEIVE          0x0C
+#define PCD_RESETPHASE          0x0F
+#define PCD_CALCCRC             0x03
+
+// Registros MFRC522
+#define CommandReg              0x01
+#define ComIEnReg               0x02
+#define DivIEnReg               0x03
+#define ComIrqReg               0x04
+#define DivIrqReg               0x05
+#define ErrorReg                0x06
+#define Status1Reg              0x07
+#define Status2Reg              0x08
+#define FIFODataReg             0x09
+#define FIFOLevelReg            0x0A
+#define WaterLevelReg           0x0B
+#define ControlReg              0x0C
+#define BitFramingReg           0x0D
+#define CollReg                 0x0E
+#define ModeReg                 0x11
+#define TxModeReg               0x12
+#define RxModeReg               0x13
+#define TxControlReg            0x14
+#define TxAutoReg               0x15
+#define TxSelReg                0x16
+#define RxSelReg                0x17
+#define RxThresholdReg          0x18
+#define DemodReg                0x19
+#define MfTxReg                 0x1C
+#define MfRxReg                 0x1D
+#define SerialSpeedReg          0x1F
+#define CRCResultRegM           0x21
+#define CRCResultRegL           0x22
+#define ModWidthReg             0x24
+#define RFCfgReg                0x26
+#define GsNReg                  0x27
+#define CWGsPReg                0x28
+#define ModGsPReg               0x29
+#define TModeReg                0x2A
+#define TPrescalerReg           0x2B
+#define TReloadRegH             0x2C
+#define TReloadRegL             0x2D
+#define TCounterValueRegH       0x2E
+#define TCounterValueRegL       0x2F
+#define TestSel1Reg             0x31
+#define TestSel2Reg             0x32
+#define TestPinEnReg            0x33
+#define TestPinValueReg         0x34
+#define TestBusReg              0x35
+#define AutoTestReg             0x36
+#define VersionReg              0x37
+#define AnalogTestReg           0x38
+#define TestDAC1Reg             0x39
+#define TestDAC2Reg             0x3A
+#define TestADCReg              0x3B
+
+// Comandos PICC
+#define PICC_CMD_REQA           0x26
+#define PICC_CMD_WUPA           0x52
+#define PICC_CMD_CT             0x88
+#define PICC_CMD_SEL_CL1        0x93
+#define PICC_CMD_SEL_CL2        0x95
+#define PICC_CMD_SEL_CL3        0x97
+#define PICC_CMD_HLTA           0x50
+
+// Estados de retorno
+#define MI_OK                   0
+#define MI_NOTAGERR             1
+#define MI_ERR                  2
+
+// Estructura para almacenar la UID
+typedef struct {
+	uint8_t size;
+	uint8_t uidByte[10];
+	uint8_t sak;
+} Uid;
+
+// Variables globales para almacenar las UIDs de ambos lectores
+Uid cardUID1;    // UID del primer lector
+Uid cardUID2;    // UID del segundo lector
+
+// Variable global para seleccionar el lector activo
+uint8_t currentReader = 1; // 1 para lector 1, 2 para lector 2
+
+// Prototipos de funciones MFRC522
+void SPI_Init(void);
+uint8_t SPI_Transfer(uint8_t data);
+void MFRC522_Init(uint8_t reader);                    // Modificada para especificar lector
+void MFRC522_Reset(uint8_t reader);                   // Modificada para especificar lector
+uint8_t MFRC522_ReadRegister(uint8_t reg, uint8_t reader);     // Modificada para especificar lector
+void MFRC522_WriteRegister(uint8_t reg, uint8_t value, uint8_t reader); // Modificada para especificar lector
+void MFRC522_SetBitMask(uint8_t reg, uint8_t mask, uint8_t reader);     // Modificada para especificar lector
+void MFRC522_ClearBitMask(uint8_t reg, uint8_t mask, uint8_t reader);   // Modificada para especificar lector
+void MFRC522_AntennaOn(uint8_t reader);               // Modificada para especificar lector
+uint8_t MFRC522_ToCard(uint8_t command, uint8_t *sendData, uint8_t sendLen, uint8_t *backData, uint16_t *backLen, uint8_t reader); // Modificada
+uint8_t MFRC522_Request(uint8_t reqMode, uint8_t *TagType, uint8_t reader);          // Modificada para especificar lector
+uint8_t MFRC522_Anticoll(uint8_t *serNum, uint8_t reader);               // Modificada para especificar lector
+uint8_t MFRC522_IsNewCardPresent(uint8_t reader);     // Modificada para especificar lector
+uint8_t MFRC522_ReadCardSerial(uint8_t reader);       // Modificada para especificar lector
+
+// Funciones para mostrar UID en LCD
+void displayUID_LCD(void);
+void byteToHex(uint8_t value, char* hexString);
+
+// Función para seleccionar el lector activo mediante SS
+void selectReader(uint8_t reader);
+
+int main(void) {
+	// Inicialización
+	twi_init();                 // TWI Initialize
+	twi_lcd_init();             // TWI LCD Initialize
+	SPI_Init();                 // SPI Initialize
+	
+	// Inicializar ambos lectores RFID
+	MFRC522_Init(1);            // Inicializar primer lector
+	MFRC522_Init(2);            // Inicializar segundo lector
+	
+	// Mostrar mensaje inicial
+	twi_lcd_cmd(0x01);          // Clear display
+	twi_lcd_msg("Dual RFID Reader");
+	twi_lcd_cmd(0xC0);          // Segunda línea
+	twi_lcd_msg("Listo...");
+	
+	_delay_ms(2000);
+	
+	uint8_t card1Present = 0, card2Present = 0;
+	
+	while(1) {
+		// Verificar primer lector
+		if (MFRC522_IsNewCardPresent(1)) {
+			if (MFRC522_ReadCardSerial(1)) {
+				card1Present = 1;
+			}
+		}
+		
+		// Verificar segundo lector
+		if (MFRC522_IsNewCardPresent(2)) {
+			if (MFRC522_ReadCardSerial(2)) {
+				card2Present = 1;
+			}
+		}
+		
+		// Mostrar resultados si hay alguna tarjeta
+		if (card1Present || card2Present) {
+			displayUID_LCD();
+			_delay_ms(3000);  // Mostrar UIDs por 3 segundos
+			
+			// Reset flags
+			card1Present = 0;
+			card2Present = 0;
+			
+			// Limpiar pantalla y mostrar mensaje de espera
+			twi_lcd_cmd(0x01);          // Clear display
+			twi_lcd_msg("Dual RFID Reader");
+			twi_lcd_cmd(0xC0);          // Segunda línea
+			twi_lcd_msg("Listo...");
+		}
+		
+		_delay_ms(100); // Pequeña pausa entre lecturas
+	}
+	
+	return 0;
+}
+
+void displayUID_LCD(void) {
+	char uidString[17]; // Buffer para la UID en formato hex
+	char hexByte[3];    // Buffer para cada byte en hex
+	
+	// Limpiar display
+	twi_lcd_cmd(0x01);
+	
+	// Mostrar UID del primer lector si existe
+	if (cardUID1.size > 0) {
+		twi_lcd_msg("R1:");
+		
+		// Convertir UID1 a hexadecimal
+		uidString[0] = '\0';
+		for(uint8_t i = 0; i < cardUID1.size && i < 5; i++) { // Máximo 5 bytes para caber en línea
+			byteToHex(cardUID1.uidByte[i], hexByte);
+			strcat(uidString, hexByte);
+			if (i < cardUID1.size - 1 && i < 4) {
+				strcat(uidString, " ");
+			}
+		}
+		twi_lcd_msg(uidString);
+	}
+	
+	// Segunda línea: UID del segundo lector
+	twi_lcd_cmd(0xC0);
+	if (cardUID2.size > 0) {
+		twi_lcd_msg("R2:");
+		
+		// Convertir UID2 a hexadecimal
+		uidString[0] = '\0';
+		for(uint8_t i = 0; i < cardUID2.size && i < 5; i++) { // Máximo 5 bytes para caber en línea
+			byteToHex(cardUID2.uidByte[i], hexByte);
+			strcat(uidString, hexByte);
+			if (i < cardUID2.size - 1 && i < 4) {
+				strcat(uidString, " ");
+			}
+		}
+		twi_lcd_msg(uidString);
+	} else {
+		twi_lcd_msg("R2: ---");
+	}
+}
+
+void byteToHex(uint8_t value, char* hexString) {
+	const char hex[] = "0123456789ABCDEF";
+	hexString[0] = hex[value >> 4];
+	hexString[1] = hex[value & 0x0F];
+	hexString[2] = '\0';
+}
+
+// Función para seleccionar el lector activo
+void selectReader(uint8_t reader) {
+	if (reader == 1) {
+		// Activar lector 1 (SS1 low, SS2 high)
+		PORTB &= ~(1<<SS1_PIN);  // SS1 low
+		PORTB |= (1<<SS2_PIN);   // SS2 high
+	} else if (reader == 2) {
+		// Activar lector 2 (SS1 high, SS2 low)
+		PORTB |= (1<<SS1_PIN);   // SS1 high
+		PORTB &= ~(1<<SS2_PIN);  // SS2 low
+	}
+}
+
+// Implementación de funciones SPI y MFRC522 modificadas
+void SPI_Init(void) {
+	// Configurar pines SPI (agregado SS2_PIN como salida)
+	DDRB |= (1<<MOSI_PIN)|(1<<SCK_PIN)|(1<<SS1_PIN)|(1<<SS2_PIN); // MOSI, SCK, SS1, SS2 como salidas
+	DDRB &= ~(1<<MISO_PIN); // MISO como entrada
+	DDRD |= (1<<RST_PIN); // RST como salida
+	
+	// Ambos SS en alto inicialmente (ningún lector seleccionado)
+	PORTB |= (1<<SS1_PIN)|(1<<SS2_PIN);
+	
+	// Habilitar SPI, Master, set clock rate fck/16
+	SPCR = (1<<SPE)|(1<<MSTR)|(1<<SPR0);
+}
+
+uint8_t SPI_Transfer(uint8_t data) {
+	SPDR = data;
+	while(!(SPSR & (1<<SPIF)));
+	return SPDR;
+}
+
+void MFRC522_Init(uint8_t reader) {
+	MFRC522_Reset(reader);
+	
+	// Timer: TPrescaler*TreloadVal/6.78MHz = 24ms
+	MFRC522_WriteRegister(TModeReg, 0x8D, reader);
+	MFRC522_WriteRegister(TPrescalerReg, 0x3E, reader);
+	MFRC522_WriteRegister(TReloadRegL, 30, reader);
+	MFRC522_WriteRegister(TReloadRegH, 0, reader);
+	
+	MFRC522_WriteRegister(TxAutoReg, 0x40, reader);
+	MFRC522_WriteRegister(ModeReg, 0x3D, reader);
+	
+	MFRC522_AntennaOn(reader);
+}
+
+void MFRC522_Reset(uint8_t reader) {
+	MFRC522_WriteRegister(CommandReg, PCD_RESETPHASE, reader);
+}
+
+uint8_t MFRC522_ReadRegister(uint8_t reg, uint8_t reader) {
+	uint8_t value;
+	selectReader(reader); // Seleccionar el lector apropiado
+	SPI_Transfer(((reg<<1)&0x7E)|0x80);
+	value = SPI_Transfer(0x00);
+	PORTB |= (1<<SS1_PIN)|(1<<SS2_PIN); // Deseleccionar ambos lectores
+	return value;
+}
+
+void MFRC522_WriteRegister(uint8_t reg, uint8_t value, uint8_t reader) {
+	selectReader(reader); // Seleccionar el lector apropiado
+	SPI_Transfer((reg<<1)&0x7E);
+	SPI_Transfer(value);
+	PORTB |= (1<<SS1_PIN)|(1<<SS2_PIN); // Deseleccionar ambos lectores
+}
+
+void MFRC522_SetBitMask(uint8_t reg, uint8_t mask, uint8_t reader) {
+	uint8_t tmp = MFRC522_ReadRegister(reg, reader);
+	MFRC522_WriteRegister(reg, tmp | mask, reader);
+}
+
+void MFRC522_ClearBitMask(uint8_t reg, uint8_t mask, uint8_t reader) {
+	uint8_t tmp = MFRC522_ReadRegister(reg, reader);
+	MFRC522_WriteRegister(reg, tmp & (~mask), reader);
+}
+
+void MFRC522_AntennaOn(uint8_t reader) {
+	uint8_t temp = MFRC522_ReadRegister(TxControlReg, reader);
+	if (!(temp & 0x03)) {
+		MFRC522_SetBitMask(TxControlReg, 0x03, reader);
+	}
+}
+
+uint8_t MFRC522_ToCard(uint8_t command, uint8_t *sendData, uint8_t sendLen, uint8_t *backData, uint16_t *backLen, uint8_t reader) {
+	uint8_t status = MI_ERR;
+	uint8_t irqEn = 0x00;
+	uint8_t waitIRq = 0x00;
+	uint8_t lastBits;
+	uint8_t n;
+	uint16_t i;
+	
+	switch (command) {
+		case PCD_AUTHENT:
+		irqEn = 0x12;
+		waitIRq = 0x10;
+		break;
+		case PCD_TRANSCEIVE:
+		irqEn = 0x77;
+		waitIRq = 0x30;
+		break;
+		default:
+		break;
+	}
+	
+	MFRC522_WriteRegister(ComIEnReg, irqEn|0x80, reader);
+	MFRC522_ClearBitMask(ComIrqReg, 0x80, reader);
+	MFRC522_SetBitMask(FIFOLevelReg, 0x80, reader);
+	
+	MFRC522_WriteRegister(CommandReg, PCD_IDLE, reader);
+	
+	for (i=0; i<sendLen; i++) {
+		MFRC522_WriteRegister(FIFODataReg, sendData[i], reader);
+	}
+	
+	MFRC522_WriteRegister(CommandReg, command, reader);
+	if (command == PCD_TRANSCEIVE) {
+		MFRC522_SetBitMask(BitFramingReg, 0x80, reader);
+	}
+	
+	i = 2000;
+	do {
+		n = MFRC522_ReadRegister(ComIrqReg, reader);
+		i--;
+	} while ((i!=0) && !(n&0x01) && !(n&waitIRq));
+	
+	MFRC522_ClearBitMask(BitFramingReg, 0x80, reader);
+	
+	if (i != 0) {
+		if(!(MFRC522_ReadRegister(ErrorReg, reader) & 0x1B)) {
+			status = MI_OK;
+			if (n & irqEn & 0x01) {
+				status = MI_NOTAGERR;
+			}
+			
+			if (command == PCD_TRANSCEIVE) {
+				n = MFRC522_ReadRegister(FIFOLevelReg, reader);
+				lastBits = MFRC522_ReadRegister(ControlReg, reader) & 0x07;
+				if (lastBits) {
+					*backLen = (n-1)*8 + lastBits;
+					} else {
+					*backLen = n*8;
+				}
+				
+				if (n == 0) {
+					n = 1;
+				}
+				if (n > 16) {
+					n = 16;
+				}
+				
+				for (i=0; i<n; i++) {
+					backData[i] = MFRC522_ReadRegister(FIFODataReg, reader);
+				}
+			}
+			} else {
+			status = MI_ERR;
+		}
+	}
+	
+	return status;
+}
+
+uint8_t MFRC522_Request(uint8_t reqMode, uint8_t *TagType, uint8_t reader) {
+	uint8_t status;
+	uint16_t backBits;
+	
+	MFRC522_WriteRegister(BitFramingReg, 0x07, reader);
+	
+	TagType[0] = reqMode;
+	status = MFRC522_ToCard(PCD_TRANSCEIVE, TagType, 1, TagType, &backBits, reader);
+	
+	if ((status != MI_OK) || (backBits != 0x10)) {
+		status = MI_ERR;
+	}
+	
+	return status;
+}
+
+uint8_t MFRC522_Anticoll(uint8_t *serNum, uint8_t reader) {
+	uint8_t status;
+	uint8_t i;
+	uint8_t serNumCheck=0;
+	uint16_t unLen;
+	
+	MFRC522_WriteRegister(BitFramingReg, 0x00, reader);
+	
+	serNum[0] = PICC_CMD_SEL_CL1;
+	serNum[1] = 0x20;
+	status = MFRC522_ToCard(PCD_TRANSCEIVE, serNum, 2, serNum, &unLen, reader);
+	
+	if (status == MI_OK) {
+		for (i=0; i<4; i++) {
+			serNumCheck ^= serNum[i];
+		}
+		if (serNumCheck != serNum[i]) {
+			status = MI_ERR;
+		}
+	}
+	
+	return status;
+}
+
+uint8_t MFRC522_IsNewCardPresent(uint8_t reader) {
+	uint8_t status;
+	uint8_t TagType[2];
+	
+	status = MFRC522_Request(PICC_CMD_REQA, TagType, reader);
+	if (status == MI_OK) {
+		return 1;
+		} else {
+		return 0;
+	}
+}
+
+uint8_t MFRC522_ReadCardSerial(uint8_t reader) {
+	uint8_t status;
+	uint8_t serNum[5];
+	uint8_t i;
+	
+	status = MFRC522_Anticoll(serNum, reader);
+	if (status == MI_OK) {
+		// Guardar la UID en la variable correspondiente al lector
+		if (reader == 1) {
+			cardUID1.size = 4; // UID de 4 bytes para tarjetas MIFARE Classic
+			for (i = 0; i < 4; i++) {
+				cardUID1.uidByte[i] = serNum[i];
+			}
+		} else if (reader == 2) {
+			cardUID2.size = 4; // UID de 4 bytes para tarjetas MIFARE Classic
+			for (i = 0; i < 4; i++) {
+				cardUID2.uidByte[i] = serNum[i];
+			}
+		}
+		return 1;
+		} else {
+		return 0;
+	}
+}
