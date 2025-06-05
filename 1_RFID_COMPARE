@@ -1,0 +1,719 @@
+#define F_CPU 8000000UL  // 8 MHz
+
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <string.h>
+#include "twi_lcd.h"
+
+// Definiciones de pines para ATmega16
+#define SS_PIN      PB4     // Pin 5 (SS)
+#define MOSI_PIN    PB5     // Pin 6 (MOSI)
+#define MISO_PIN    PB6     // Pin 7 (MISO)
+#define SCK_PIN     PB7     // Pin 8 (SCK)
+#define RST_PIN     PB0     // Pin 16 (RST)
+
+// Comandos MFRC522
+#define PCD_IDLE                0x00
+#define PCD_AUTHENT             0x0E
+#define PCD_RECEIVE             0x08
+#define PCD_TRANSMIT            0x04
+#define PCD_TRANSCEIVE          0x0C
+#define PCD_RESETPHASE          0x0F
+#define PCD_CALCCRC             0x03
+
+// Registros MFRC522
+#define CommandReg              0x01
+#define ComIEnReg               0x02
+#define DivIEnReg               0x03
+#define ComIrqReg               0x04
+#define DivIrqReg               0x05
+#define ErrorReg                0x06
+#define Status1Reg              0x07
+#define Status2Reg              0x08
+#define FIFODataReg             0x09
+#define FIFOLevelReg            0x0A
+#define WaterLevelReg           0x0B
+#define ControlReg              0x0C
+#define BitFramingReg           0x0D
+#define CollReg                 0x0E
+#define ModeReg                 0x11
+#define TxModeReg               0x12
+#define RxModeReg               0x13
+#define TxControlReg            0x14
+#define TxAutoReg               0x15
+#define TxSelReg                0x16
+#define RxSelReg                0x17
+#define RxThresholdReg          0x18
+#define DemodReg                0x19
+#define MfTxReg                 0x1C
+#define MfRxReg                 0x1D
+#define SerialSpeedReg          0x1F
+#define CRCResultRegM           0x21
+#define CRCResultRegL           0x22
+#define ModWidthReg             0x24
+#define RFCfgReg                0x26
+#define GsNReg                  0x27
+#define CWGsPReg                0x28
+#define ModGsPReg               0x29
+#define TModeReg                0x2A
+#define TPrescalerReg           0x2B
+#define TReloadRegH             0x2C
+#define TReloadRegL             0x2D
+#define TCounterValueRegH       0x2E
+#define TCounterValueRegL       0x2F
+#define TestSel1Reg             0x31
+#define TestSel2Reg             0x32
+#define TestPinEnReg            0x33
+#define TestPinValueReg         0x34
+#define TestBusReg              0x35
+#define AutoTestReg             0x36
+#define VersionReg              0x37
+#define AnalogTestReg           0x38
+#define TestDAC1Reg             0x39
+#define TestDAC2Reg             0x3A
+#define TestADCReg              0x3B
+
+// Comandos PICC
+#define PICC_CMD_REQA           0x26
+#define PICC_CMD_WUPA           0x52
+#define PICC_CMD_CT             0x88
+#define PICC_CMD_SEL_CL1        0x93
+#define PICC_CMD_SEL_CL2        0x95
+#define PICC_CMD_SEL_CL3        0x97
+#define PICC_CMD_HLTA           0x50
+
+// Estados de retorno
+#define MI_OK                   0
+#define MI_NOTAGERR             1
+#define MI_ERR                  2
+
+// Configuración para múltiples UIDs
+#define EEPROM_START_ADDRESS    0x10    // Dirección inicial en EEPROM
+#define MAX_AUTHORIZED_UIDS     20      // Máximo número de UIDs autorizadas
+#define UID_SIZE                4       // Tamaño de cada UID en bytes
+#define EEPROM_BLOCK_SIZE       8       // 4 bytes UID + 4 bytes de separación/control
+
+// Estructura para almacenar la UID
+typedef struct {
+	uint8_t size;
+	uint8_t uidByte[10];
+	uint8_t sak;
+} Uid;
+
+// Variable global para almacenar la UID leída
+Uid cardUID;
+
+// Prototipos de funciones EEPROM
+void EEPROM_write(unsigned int uiAddress, unsigned char ucData);
+unsigned char EEPROM_read(unsigned int uiAddress);
+
+// Prototipos de funciones MFRC522
+void SPI_Init(void);
+uint8_t SPI_Transfer(uint8_t data);
+void MFRC522_Init(void);
+void MFRC522_Reset(void);
+uint8_t MFRC522_ReadRegister(uint8_t reg);
+void MFRC522_WriteRegister(uint8_t reg, uint8_t value);
+void MFRC522_SetBitMask(uint8_t reg, uint8_t mask);
+void MFRC522_ClearBitMask(uint8_t reg, uint8_t mask);
+void MFRC522_AntennaOn(void);
+uint8_t MFRC522_ToCard(uint8_t command, uint8_t *sendData, uint8_t sendLen, uint8_t *backData, uint16_t *backLen);
+uint8_t MFRC522_Request(uint8_t reqMode, uint8_t *TagType);
+uint8_t MFRC522_Anticoll(uint8_t *serNum);
+uint8_t MFRC522_IsNewCardPresent(void);
+uint8_t MFRC522_ReadCardSerial(void);
+
+// Funciones para manejo de múltiples UIDs
+void displayUID_LCD(void);
+void byteToHex(uint8_t value, char* hexString);
+uint8_t checkUID_Authorization(void);
+void displayAccessResult(uint8_t access_granted);
+void showDiagnostic(void);
+uint8_t addUID_ToEEPROM(uint8_t* uid);
+uint8_t getNextFreeSlot(void);
+void initializeEEPROM(void);
+uint8_t isValidUID(uint8_t* uid);
+void displayAuthorizedCount(void);
+
+// Implementación de funciones EEPROM
+void EEPROM_write(unsigned int uiAddress, unsigned char ucData) {
+	/* Wait for completion of previous write */
+	while(EECR & (1<<EEWE))
+	;
+	/* Set up address and data registers */
+	EEAR = uiAddress;
+	EEDR = ucData;
+	/* Write logical one to EEMWE */
+	EECR |= (1<<EEMWE);
+	/* Start eeprom write by setting EEWE */
+	EECR |= (1<<EEWE);
+}
+
+unsigned char EEPROM_read(unsigned int uiAddress) {
+	/* Wait for completion of previous write */
+	while(EECR & (1<<EEWE))
+	;
+	/* Set up address register */
+	EEAR = uiAddress;
+	/* Start eeprom read by writing EERE */
+	EECR |= (1<<EERE);
+	/* Return data from data register */
+	return EEDR;
+}
+
+// Inicializar EEPROM si es la primera vez
+void initializeEEPROM(void) {
+	// Verificar si la EEPROM está inicializada (byte de control en primera posición)
+	if (EEPROM_read(EEPROM_START_ADDRESS - 1) != 0xAA) {
+		// Limpiar área de UIDs autorizadas
+		for (uint16_t i = 0; i < (MAX_AUTHORIZED_UIDS * EEPROM_BLOCK_SIZE); i++) {
+			EEPROM_write(EEPROM_START_ADDRESS + i, 0xFF);
+		}
+		// Marcar EEPROM como inicializada
+		EEPROM_write(EEPROM_START_ADDRESS - 1, 0xAA);
+	}
+}
+
+// Verificar si una UID es válida (no está vacía)
+uint8_t isValidUID(uint8_t* uid) {
+	for (uint8_t i = 0; i < UID_SIZE; i++) {
+		if (uid[i] != 0xFF && uid[i] != 0x00) {
+			return 1; // UID válida
+		}
+	}
+	return 0; // UID vacía o inválida
+}
+
+// Buscar el próximo slot libre en EEPROM
+uint8_t getNextFreeSlot(void) {
+	uint8_t temp_uid[UID_SIZE];
+	
+	for (uint8_t slot = 0; slot < MAX_AUTHORIZED_UIDS; slot++) {
+		// Leer UID del slot actual
+		for (uint8_t i = 0; i < UID_SIZE; i++) {
+			temp_uid[i] = EEPROM_read(EEPROM_START_ADDRESS + (slot * EEPROM_BLOCK_SIZE) + i);
+		}
+		
+		// Si el slot está vacío (todos los bytes son 0xFF), retornar este slot
+		if (!isValidUID(temp_uid)) {
+			return slot;
+		}
+	}
+	
+	return 0xFF; // No hay slots libres
+}
+
+// Verificar si la UID actual está autorizada
+uint8_t checkUID_Authorization(void) {
+	uint8_t temp_uid[UID_SIZE];
+	uint8_t match;
+	
+	for (uint8_t slot = 0; slot < MAX_AUTHORIZED_UIDS; slot++) {
+		// Leer UID del slot actual
+		for (uint8_t i = 0; i < UID_SIZE; i++) {
+			temp_uid[i] = EEPROM_read(EEPROM_START_ADDRESS + (slot * EEPROM_BLOCK_SIZE) + i);
+		}
+		
+		// Solo verificar si la UID es válida
+		if (isValidUID(temp_uid)) {
+			// Comparar con la UID de la tarjeta actual
+			match = 1;
+			for (uint8_t i = 0; i < UID_SIZE; i++) {
+				if (cardUID.uidByte[i] != temp_uid[i]) {
+					match = 0;
+					break;
+				}
+			}
+			
+			if (match) {
+				return 1; // UID autorizada encontrada
+			}
+		}
+	}
+	
+	return 0; // UID no autorizada
+}
+
+// Agregar nueva UID a EEPROM
+uint8_t addUID_ToEEPROM(uint8_t* uid) {
+	uint8_t free_slot = getNextFreeSlot();
+	
+	if (free_slot == 0xFF) {
+		return 0; // No hay espacio disponible
+	}
+	
+	// Guardar la nueva UID en el slot libre
+	for (uint8_t i = 0; i < UID_SIZE; i++) {
+		EEPROM_write(EEPROM_START_ADDRESS + (free_slot * EEPROM_BLOCK_SIZE) + i, uid[i]);
+	}
+	
+	return 1; // UID guardada exitosamente
+}
+
+// Mostrar cantidad de UIDs autorizadas
+void displayAuthorizedCount(void) {
+	uint8_t count = 0;
+	uint8_t temp_uid[UID_SIZE];
+	char count_str[17];
+	
+	// Contar UIDs válidas
+	for (uint8_t slot = 0; slot < MAX_AUTHORIZED_UIDS; slot++) {
+		for (uint8_t i = 0; i < UID_SIZE; i++) {
+			temp_uid[i] = EEPROM_read(EEPROM_START_ADDRESS + (slot * EEPROM_BLOCK_SIZE) + i);
+		}
+		if (isValidUID(temp_uid)) {
+			count++;
+		}
+	}
+	
+	twi_lcd_cmd(0x01);
+	twi_lcd_msg("UIDs autorizadas:");
+	twi_lcd_cmd(0xC0);
+	
+	// Convertir número a string manualmente
+	if (count == 0) {
+		strcpy(count_str, "0");
+		} else {
+		uint8_t temp = count;
+		uint8_t digits = 0;
+		
+		// Contar dígitos
+		while (temp > 0) {
+			digits++;
+			temp /= 10;
+		}
+		
+		count_str[digits] = '\0';
+		temp = count;
+		
+		for (int8_t i = digits - 1; i >= 0; i--) {
+			count_str[i] = '0' + (temp % 10);
+			temp /= 10;
+		}
+	}
+	
+	strcat(count_str, " de ");
+	
+	// Agregar máximo
+	char max_str[4];
+	uint8_t max_temp = MAX_AUTHORIZED_UIDS;
+	uint8_t max_digits = 0;
+	
+	while (max_temp > 0) {
+		max_digits++;
+		max_temp /= 10;
+	}
+	
+	max_str[max_digits] = '\0';
+	max_temp = MAX_AUTHORIZED_UIDS;
+	
+	for (int8_t i = max_digits - 1; i >= 0; i--) {
+		max_str[i] = '0' + (max_temp % 10);
+		max_temp /= 10;
+	}
+	
+	strcat(count_str, max_str);
+	twi_lcd_msg(count_str);
+}
+
+int main(void) {
+	// Inicialización
+	twi_init();                 // TWI Initialize
+	twi_lcd_init();             // TWI LCD Initialize
+	SPI_Init();                 // SPI Initialize
+	MFRC522_Init();             // MFRC522 Initialize
+	
+	// Inicializar EEPROM para múltiples UIDs
+	initializeEEPROM();
+	
+	// Mostrar mensaje inicial
+	twi_lcd_cmd(0x01);          // Clear display
+	twi_lcd_msg("RFID Multi-User");
+	twi_lcd_cmd(0xC0);          // Segunda línea
+	twi_lcd_msg("Acerca tarjeta");
+	
+	_delay_ms(2000);
+	
+	// Mostrar cantidad de UIDs autorizadas
+	displayAuthorizedCount();
+	_delay_ms(3000);
+	
+	// Mostrar mensaje de espera inicial
+	twi_lcd_cmd(0x01);          // Clear display
+	twi_lcd_msg("RFID Multi-User");
+	twi_lcd_cmd(0xC0);          // Segunda línea
+	twi_lcd_msg("Acerca tarjeta");
+	
+	while(1) {
+		// Verificar si hay una nueva tarjeta presente
+		if (!MFRC522_IsNewCardPresent()) {
+			_delay_ms(100); // Pequeña pausa para no saturar el bucle
+			continue;
+		}
+		
+		// Leer el serial de la tarjeta
+		if (!MFRC522_ReadCardSerial()) {
+			continue;
+		}
+		
+		// Mostrar UID de la tarjeta
+		displayUID_LCD();
+		_delay_ms(2000);
+		
+		// DIAGNÓSTICO: Mostrar información de autorización
+		showDiagnostic();
+		
+		// Verificar si la UID está autorizada
+		uint8_t access_granted = checkUID_Authorization();
+		
+		// Mostrar resultado del acceso
+		displayAccessResult(access_granted);
+		_delay_ms(2000);
+		
+		// Si no está autorizada, preguntar si se desea agregar
+		if (!access_granted) {
+			twi_lcd_cmd(0x01);
+			twi_lcd_msg("Agregar como");
+			twi_lcd_cmd(0xC0);
+			twi_lcd_msg("autorizada? (3s)");
+			
+			// Esperar 3 segundos para decisión (simulando botón)
+			_delay_ms(3000);
+			
+			// Intentar agregar la nueva UID
+			if (addUID_ToEEPROM(cardUID.uidByte)) {
+				twi_lcd_cmd(0x01);
+				twi_lcd_msg("Nueva UID");
+				twi_lcd_cmd(0xC0);
+				twi_lcd_msg("agregada!");
+				} else {
+				twi_lcd_cmd(0x01);
+				twi_lcd_msg("Memoria llena!");
+				twi_lcd_cmd(0xC0);
+				twi_lcd_msg("No se agrego");
+			}
+			_delay_ms(2000);
+			
+			// Mostrar nueva cantidad
+			displayAuthorizedCount();
+			_delay_ms(2000);
+		}
+		
+		_delay_ms(1000);  // Pausa antes de volver al estado de espera
+		
+		// Restaurar mensaje de espera
+		twi_lcd_cmd(0x01);          // Clear display
+		twi_lcd_msg("RFID Multi-User");
+		twi_lcd_cmd(0xC0);          // Segunda línea
+		twi_lcd_msg("Acerca tarjeta");
+	}
+	
+	return 0;
+}
+
+void showDiagnostic(void) {
+	uint8_t count = 0;
+	uint8_t temp_uid[UID_SIZE];
+	char debug_msg[17];
+	
+	// Contar UIDs autorizadas
+	for (uint8_t slot = 0; slot < MAX_AUTHORIZED_UIDS; slot++) {
+		for (uint8_t i = 0; i < UID_SIZE; i++) {
+			temp_uid[i] = EEPROM_read(EEPROM_START_ADDRESS + (slot * EEPROM_BLOCK_SIZE) + i);
+		}
+		if (isValidUID(temp_uid)) {
+			count++;
+		}
+	}
+	
+	// Mostrar información de diagnóstico
+	twi_lcd_cmd(0x01);
+	twi_lcd_msg("Verificando...");
+	twi_lcd_cmd(0xC0);
+	strcpy(debug_msg, "UIDs: ");
+	
+	// Convertir count a string
+	if (count < 10) {
+		debug_msg[6] = '0' + count;
+		debug_msg[7] = '\0';
+		} else {
+		debug_msg[6] = '0' + (count / 10);
+		debug_msg[7] = '0' + (count % 10);
+		debug_msg[8] = '\0';
+	}
+	
+	twi_lcd_msg(debug_msg);
+	_delay_ms(2000);
+}
+
+void displayAccessResult(uint8_t access_granted) {
+	// Limpiar display
+	twi_lcd_cmd(0x01);
+	
+	if (access_granted) {
+		// Primera línea: "Acceso"
+		twi_lcd_msg("Acceso");
+		// Segunda línea: "Otorgado"
+		twi_lcd_cmd(0xC0);
+		twi_lcd_msg("Otorgado");
+		} else {
+		// Primera línea: "Acceso"
+		twi_lcd_msg("Acceso");
+		// Segunda línea: "Denegado"
+		twi_lcd_cmd(0xC0);
+		twi_lcd_msg("Denegado");
+	}
+}
+
+void displayUID_LCD(void) {
+	char uidString[17]; // Buffer para la UID en formato hex (16 chars + null terminator)
+	char hexByte[3];    // Buffer para cada byte en hex
+	
+	// Limpiar display
+	twi_lcd_cmd(0x01);
+	
+	// Primera línea: "UID:"
+	twi_lcd_msg("UID:");
+	
+	// Segunda línea: UID en hexadecimal
+	twi_lcd_cmd(0xC0);
+	
+	// Convertir cada byte de la UID a hexadecimal
+	uidString[0] = '\0'; // Inicializar string vacío
+	
+	for(uint8_t i = 0; i < cardUID.size && i < 8; i++) { // Máximo 8 bytes para caber en LCD
+		byteToHex(cardUID.uidByte[i], hexByte);
+		strcat(uidString, hexByte);
+		if (i < cardUID.size - 1 && i < 7) {
+			strcat(uidString, " "); // Agregar espacio entre bytes
+		}
+	}
+	
+	twi_lcd_msg(uidString);
+}
+
+void byteToHex(uint8_t value, char* hexString) {
+	const char hex[] = "0123456789ABCDEF";
+	hexString[0] = hex[value >> 4];
+	hexString[1] = hex[value & 0x0F];
+	hexString[2] = '\0';
+}
+
+// Implementación de funciones SPI y MFRC522
+void SPI_Init(void) {
+	// Configurar pines SPI
+	DDRB |= (1<<MOSI_PIN)|(1<<SCK_PIN)|(1<<SS_PIN); // MOSI, SCK, SS como salidas
+	DDRB &= ~(1<<MISO_PIN); // MISO como entrada
+	DDRD |= (1<<RST_PIN); // RST como salida
+	
+	// Habilitar SPI, Master, set clock rate fck/16
+	SPCR = (1<<SPE)|(1<<MSTR)|(1<<SPR0);
+}
+
+uint8_t SPI_Transfer(uint8_t data) {
+	SPDR = data;
+	while(!(SPSR & (1<<SPIF)));
+	return SPDR;
+}
+
+void MFRC522_Init(void) {
+	MFRC522_Reset();
+	
+	// Timer: TPrescaler*TreloadVal/6.78MHz = 24ms
+	MFRC522_WriteRegister(TModeReg, 0x8D);
+	MFRC522_WriteRegister(TPrescalerReg, 0x3E);
+	MFRC522_WriteRegister(TReloadRegL, 30);
+	MFRC522_WriteRegister(TReloadRegH, 0);
+	
+	MFRC522_WriteRegister(TxAutoReg, 0x40);
+	MFRC522_WriteRegister(ModeReg, 0x3D);
+	
+	MFRC522_AntennaOn();
+}
+
+void MFRC522_Reset(void) {
+	MFRC522_WriteRegister(CommandReg, PCD_RESETPHASE);
+}
+
+uint8_t MFRC522_ReadRegister(uint8_t reg) {
+	uint8_t value;
+	PORTB &= ~(1<<SS_PIN); // SS low
+	SPI_Transfer(((reg<<1)&0x7E)|0x80);
+	value = SPI_Transfer(0x00);
+	PORTB |= (1<<SS_PIN); // SS high
+	return value;
+}
+
+void MFRC522_WriteRegister(uint8_t reg, uint8_t value) {
+	PORTB &= ~(1<<SS_PIN); // SS low
+	SPI_Transfer((reg<<1)&0x7E);
+	SPI_Transfer(value);
+	PORTB |= (1<<SS_PIN); // SS high
+}
+
+void MFRC522_SetBitMask(uint8_t reg, uint8_t mask) {
+	uint8_t tmp = MFRC522_ReadRegister(reg);
+	MFRC522_WriteRegister(reg, tmp | mask);
+}
+
+void MFRC522_ClearBitMask(uint8_t reg, uint8_t mask) {
+	uint8_t tmp = MFRC522_ReadRegister(reg);
+	MFRC522_WriteRegister(reg, tmp & (~mask));
+}
+
+void MFRC522_AntennaOn(void) {
+	uint8_t temp = MFRC522_ReadRegister(TxControlReg);
+	if (!(temp & 0x03)) {
+		MFRC522_SetBitMask(TxControlReg, 0x03);
+	}
+}
+
+uint8_t MFRC522_ToCard(uint8_t command, uint8_t *sendData, uint8_t sendLen, uint8_t *backData, uint16_t *backLen) {
+	uint8_t status = MI_ERR;
+	uint8_t irqEn = 0x00;
+	uint8_t waitIRq = 0x00;
+	uint8_t lastBits;
+	uint8_t n;
+	uint16_t i;
+	
+	switch (command) {
+		case PCD_AUTHENT:
+		irqEn = 0x12;
+		waitIRq = 0x10;
+		break;
+		case PCD_TRANSCEIVE:
+		irqEn = 0x77;
+		waitIRq = 0x30;
+		break;
+		default:
+		break;
+	}
+	
+	MFRC522_WriteRegister(ComIEnReg, irqEn|0x80);
+	MFRC522_ClearBitMask(ComIrqReg, 0x80);
+	MFRC522_SetBitMask(FIFOLevelReg, 0x80);
+	
+	MFRC522_WriteRegister(CommandReg, PCD_IDLE);
+	
+	for (i=0; i<sendLen; i++) {
+		MFRC522_WriteRegister(FIFODataReg, sendData[i]);
+	}
+	
+	MFRC522_WriteRegister(CommandReg, command);
+	if (command == PCD_TRANSCEIVE) {
+		MFRC522_SetBitMask(BitFramingReg, 0x80);
+	}
+	
+	i = 2000;
+	do {
+		n = MFRC522_ReadRegister(ComIrqReg);
+		i--;
+	} while ((i!=0) && !(n&0x01) && !(n&waitIRq));
+	
+	MFRC522_ClearBitMask(BitFramingReg, 0x80);
+	
+	if (i != 0) {
+		if(!(MFRC522_ReadRegister(ErrorReg) & 0x1B)) {
+			status = MI_OK;
+			if (n & irqEn & 0x01) {
+				status = MI_NOTAGERR;
+			}
+			
+			if (command == PCD_TRANSCEIVE) {
+				n = MFRC522_ReadRegister(FIFOLevelReg);
+				lastBits = MFRC522_ReadRegister(ControlReg) & 0x07;
+				if (lastBits) {
+					*backLen = (n-1)*8 + lastBits;
+					} else {
+					*backLen = n*8;
+				}
+				
+				if (n == 0) {
+					n = 1;
+				}
+				if (n > 16) {
+					n = 16;
+				}
+				
+				for (i=0; i<n; i++) {
+					backData[i] = MFRC522_ReadRegister(FIFODataReg);
+				}
+			}
+			} else {
+			status = MI_ERR;
+		}
+	}
+	
+	return status;
+}
+
+uint8_t MFRC522_Request(uint8_t reqMode, uint8_t *TagType) {
+	uint8_t status;
+	uint16_t backBits;
+	
+	MFRC522_WriteRegister(BitFramingReg, 0x07);
+	
+	TagType[0] = reqMode;
+	status = MFRC522_ToCard(PCD_TRANSCEIVE, TagType, 1, TagType, &backBits);
+	
+	if ((status != MI_OK) || (backBits != 0x10)) {
+		status = MI_ERR;
+	}
+	
+	return status;
+}
+
+uint8_t MFRC522_Anticoll(uint8_t *serNum) {
+	uint8_t status;
+	uint8_t i;
+	uint8_t serNumCheck=0;
+	uint16_t unLen;
+	
+	MFRC522_WriteRegister(BitFramingReg, 0x00);
+	
+	serNum[0] = PICC_CMD_SEL_CL1;
+	serNum[1] = 0x20;
+	status = MFRC522_ToCard(PCD_TRANSCEIVE, serNum, 2, serNum, &unLen);
+	
+	if (status == MI_OK) {
+		for (i=0; i<4; i++) {
+			serNumCheck ^= serNum[i];
+		}
+		if (serNumCheck != serNum[i]) {
+			status = MI_ERR;
+		}
+	}
+	
+	return status;
+}
+
+uint8_t MFRC522_IsNewCardPresent(void) {
+	uint8_t status;
+	uint8_t TagType[2];
+	
+	status = MFRC522_Request(PICC_CMD_REQA, TagType);
+	if (status == MI_OK) {
+		return 1;
+		} else {
+		return 0;
+	}
+}
+
+uint8_t MFRC522_ReadCardSerial(void) {
+	uint8_t status;
+	uint8_t serNum[5];
+	uint8_t i;
+	
+	status = MFRC522_Anticoll(serNum);
+	if (status == MI_OK) {
+		// Guardar la UID en la variable global
+		cardUID.size = 4; // UID de 4 bytes para tarjetas MIFARE Classic
+		for (i = 0; i < 4; i++) {
+			cardUID.uidByte[i] = serNum[i];
+		}
+		return 1;
+		} else {
+			 return 0;
+		 }
+	 }
