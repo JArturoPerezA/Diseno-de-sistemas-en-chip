@@ -1,0 +1,248 @@
+/**
+ * Sensor Ultrasónico HC-SR04 con Display TWI LCD
+ * Adaptado del código original para usar la librería TWI LCD del sistema RFID
+ */
+
+#define F_CPU 8000000UL  // 8 MHz
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <stdlib.h>
+#include <string.h>
+#include "twi_lcd.h"  // Librería TWI LCD del sistema RFID
+
+// Funciones del sensor ultrasónico
+void Send_signal(void);
+void Initialize_external_interrupt(void);
+void Initialize_timer0(void);
+void Update_display(void);
+void Go_to_position(uint8_t column, uint8_t row);
+void Clear_position(uint8_t column, uint8_t count);
+
+// Variables globales
+unsigned char working;
+unsigned char rising_edge;
+uint16_t timer_value;
+int distance_cm;
+uint8_t error;
+
+// Variables para optimización del display
+int last_distance = -1;
+uint8_t last_error = 2;  // Valor inicial diferente para forzar primera actualización
+
+// Interrupción por overflow del Timer0
+ISR (TIMER0_OVF_vect) {
+    if(rising_edge == 1) // Check if there was echo
+    {
+        timer_value++;
+        // Check if isn't out of range
+        if(timer_value > 91) {
+            working = 0;
+            rising_edge = 0;
+            error = 1;
+        }
+    }
+}
+
+// Interrupción externa INT1 para el pin de echo
+ISR (INT1_vect) {
+    if(working == 1) // Check if echo is high, start timer
+    {
+        if(rising_edge == 0) {
+            rising_edge = 1;
+            TCNT0 = 0;
+            timer_value = 0;
+        }
+        else // Check if echo turned low, calculate distance
+        {
+            rising_edge = 0;
+            distance_cm = (timer_value * 256 + TCNT0) / 58;
+            working = 0;
+        }
+    }
+}
+
+// Función para posicionar cursor en el LCD TWI (equivalente a Go_to_Lcd_location)
+void Go_to_position(uint8_t column, uint8_t row) {
+    uint8_t position;
+    
+    if (row == 0) {
+        position = 0x80 + column;  // Primera línea: 0x80 + columna
+    } else {
+        position = 0xC0 + column;  // Segunda línea: 0xC0 + columna
+    }
+    
+    twi_lcd_cmd(position);
+}
+
+// Función para limpiar posiciones específicas del LCD
+void Clear_position(uint8_t column, uint8_t count) {
+    Go_to_position(column, 0);
+    for(uint8_t i = 0; i < count; i++) {
+        twi_lcd_dwr(' ');  // Enviar espacio
+    }
+}
+
+// Función optimizada para actualizar solo cuando hay cambios
+void Update_display(void) {
+    char value[6];  // Buffer más grande para números de 3 dígitos
+    
+    // Solo actualizar si hay cambios
+    if (distance_cm != last_distance || error != last_error) {
+        
+        // Limpiar área de la distancia anterior
+        Clear_position(11, 5);  // Limpiar "XXX cm" o "---"
+        
+        // Mostrar texto fijo si es la primera vez
+        if (last_distance == -1) {
+            Go_to_position(0, 0);
+            twi_lcd_msg("Distance = ");
+        }
+        
+        if (error == 1) {
+            Go_to_position(11, 0);
+            twi_lcd_msg("---");
+        } else {
+            // Convertir distancia a string
+            itoa(distance_cm, value, 10);
+            
+            Go_to_position(11, 0);
+            twi_lcd_msg(value);
+            Go_to_position(14, 0);
+            twi_lcd_msg("cm");
+        }
+        
+        // Actualizar valores anteriores
+        last_distance = distance_cm;
+        last_error = error;
+    }
+}
+
+// Función para enviar pulso de trigger al HC-SR04
+void Send_signal() {
+    if(working == 0) // Be sure that conversation is finished
+    {
+        _delay_ms(50); // Restart HC-SR04
+        PORTD &= ~(1 << PIND4);  // Trigger bajo
+        _delay_us(1);
+        PORTD |= (1 << PIND4);   // Send 10us pulse
+        _delay_us(10);
+        PORTD &= ~(1 << PIND4);  // Trigger bajo
+        working = 1;             // Be sure that it is ready
+        error = 0;               // Clean errors
+    }
+}
+
+// Inicializar interrupción externa INT1
+void Initialize_external_interrupt() {
+    MCUCR |= (1 << ISC10);  // Any logical change on INT1
+    GICR |= (1 << INT1);    // Enable INT1
+}
+
+// Inicializar Timer0
+void Initialize_timer0() {
+    TCCR0 |= (1 << CS00);   // No prescaling
+    TCNT0 = 0;              // Reset timer
+    TIMSK |= (1 << TOIE0);  // Timer overflow interrupt enable
+}
+
+int main(void) {
+    // Inicialización del sistema TWI y LCD
+    twi_init();         // Inicializar TWI
+    twi_lcd_init();     // Inicializar LCD TWI
+    
+    // Inicializar interrupciones y timer
+    Initialize_external_interrupt();
+    Initialize_timer0();
+    
+    // Configurar pines
+    DDRB |= (1 << PINB1);   // PB1 como salida (si se necesita)
+    DDRD &= ~(1 << PIND3);  // PD3 como entrada (INT1 - Echo)
+    DDRD |= (1 << PIND4);   // PD4 como salida (Trigger)
+    
+    // Habilitar interrupciones globales
+    sei();
+    
+    // Mostrar mensaje inicial
+    twi_lcd_cmd(0x01);  // Clear display
+    twi_lcd_msg("Sensor Ultrason.");
+    twi_lcd_cmd(0xC0);  // Segunda línea
+    twi_lcd_msg("Iniciando...");
+    _delay_ms(2000);
+    
+    // Limpiar pantalla para operación normal
+    twi_lcd_cmd(0x01);
+    
+    // Bucle principal
+    while(1) {
+        // Actualizar display solo si hay cambios
+        Update_display();
+        
+        // Enviar señal para nueva medición
+        Send_signal();
+        
+        // Pequeña pausa entre mediciones
+        _delay_ms(100);
+    }
+    
+    return 0;
+}
+
+// Funciones adicionales para compatibilidad y depuración
+
+// Función para mostrar información de depuración
+void Display_debug_info(void) {
+    char debug_str[10];
+    
+    // Mostrar información en segunda línea
+    Go_to_position(0, 1);
+    twi_lcd_msg("T:");
+    
+    // Mostrar valor del timer
+    itoa(timer_value, debug_str, 10);
+    twi_lcd_msg(debug_str);
+    
+    // Mostrar estado
+    twi_lcd_msg(" W:");
+    twi_lcd_dwr(working ? '1' : '0');
+    
+    twi_lcd_msg(" E:");
+    twi_lcd_dwr(error ? '1' : '0');
+}
+
+// Función para test del sensor
+void Test_sensor(void) {
+    twi_lcd_cmd(0x01);
+    twi_lcd_msg("Test HC-SR04");
+    twi_lcd_cmd(0xC0);
+    twi_lcd_msg("Verificando...");
+    _delay_ms(2000);
+    
+    // Realizar varias mediciones de prueba
+    for(uint8_t i = 0; i < 5; i++) {
+        Send_signal();
+        _delay_ms(200);
+        
+        twi_lcd_cmd(0x01);
+        twi_lcd_msg("Test ");
+        twi_lcd_dwr('0' + i + 1);
+        twi_lcd_msg(": ");
+        
+        if(!error && distance_cm > 0) {
+            char test_value[6];
+            itoa(distance_cm, test_value, 10);
+            twi_lcd_msg(test_value);
+            twi_lcd_msg("cm");
+        } else {
+            twi_lcd_msg("Error");
+        }
+        
+        _delay_ms(1000);
+    }
+    
+    twi_lcd_cmd(0x01);
+    twi_lcd_msg("Test completado");
+    _delay_ms(2000);
+    twi_lcd_cmd(0x01);
+}
